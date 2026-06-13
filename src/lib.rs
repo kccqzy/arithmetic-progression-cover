@@ -12,12 +12,77 @@
 //! This file is a faithful port of `ap_cover.py`; see that file's module
 //! docstring for the mathematical background.
 
-use rug::Integer;
-use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 
 /// (s, d, n): start, difference, count.  `n = None` means an infinite AP.
 pub type AP = (i64, i64, Option<i64>);
+
+// ----------------------------------------------------------------- bitset
+
+/// Fixed-width packed bitset of `n_words * 64` bits, used as the ground-set
+/// mask inside `set_cover`.  All bitsets passed through one `set_cover` call
+/// must share the same word count (= `n_bits.div_ceil(64)` for that call's
+/// `n_univ`); operations below assume that and pair up words by index.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Bitset {
+    words: Vec<u64>,
+}
+
+impl Bitset {
+    pub fn empty(n_bits: usize) -> Self {
+        Self { words: vec![0u64; n_bits.div_ceil(64)] }
+    }
+
+    /// Bits `0..n_bits` set, the rest zero.
+    pub fn full(n_bits: usize) -> Self {
+        let mut bs = Self { words: vec![!0u64; n_bits.div_ceil(64)] };
+        let tail = n_bits % 64;
+        if tail != 0 {
+            *bs.words.last_mut().unwrap() = (!0u64) >> (64 - tail);
+        }
+        bs
+    }
+
+    pub fn get(&self, i: usize) -> bool {
+        (self.words[i / 64] >> (i % 64)) & 1 != 0
+    }
+
+    pub fn insert(&mut self, i: usize) {
+        self.words[i / 64] |= 1u64 << (i % 64);
+    }
+
+    pub fn count(&self) -> u32 {
+        self.words.iter().map(|w| w.count_ones()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|&w| w == 0)
+    }
+
+    /// `self | other`.
+    pub fn union(&self, other: &Self) -> Self {
+        Self {
+            words: self.words.iter().zip(&other.words).map(|(&a, &b)| a | b).collect(),
+        }
+    }
+
+    /// `self & !other` (bits in `self` not in `other`).
+    pub fn difference(&self, other: &Self) -> Self {
+        Self {
+            words: self.words.iter().zip(&other.words).map(|(&a, &b)| a & !b).collect(),
+        }
+    }
+
+    /// True iff `self` is a (possibly improper) subset of `other`.
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        self.words.iter().zip(&other.words).all(|(&a, &b)| a & !b == 0)
+    }
+
+    /// `(self & other).count()`, without allocating the intersection.
+    pub fn intersect_count(&self, other: &Self) -> u32 {
+        self.words.iter().zip(&other.words).map(|(&a, &b)| (a & b).count_ones()).sum()
+    }
+}
 
 // ----------------------------------------------------------- normalization
 
@@ -157,39 +222,35 @@ pub fn finite_candidates(f: &BTreeSet<i64>) -> Vec<(i64, i64, i64)> {
 /// Exact minimum set cover of `{0..n_univ-1}`; `cands` is `[(mask, payload)]`.
 /// Returns chosen payloads, or `None` if infeasible.  Branch and bound over
 /// bitmasks with greedy upper bound, dominance pruning, and memoization.
-pub fn set_cover(n_univ: usize, cands: Vec<(Integer, AP)>) -> Option<Vec<AP>> {
-    let full: Integer = (Integer::from(1) << n_univ as u32) - Integer::from(1);
-    if full == 0 {
+pub fn set_cover(n_univ: usize, cands: Vec<(Bitset, AP)>) -> Option<Vec<AP>> {
+    let full = Bitset::full(n_univ);
+    if full.is_empty() {
         return Some(Vec::new());
     }
 
     // First occurrence of each non-zero mask wins, preserving insertion order.
-    let mut by_mask: HashMap<Integer, AP> = HashMap::new();
-    let mut order: Vec<Integer> = Vec::new();
+    let mut by_mask: HashMap<Bitset, AP> = HashMap::new();
+    let mut order: Vec<Bitset> = Vec::new();
     for (m, p) in cands {
-        if m != 0 && !by_mask.contains_key(&m) {
+        if !m.is_empty() && !by_mask.contains_key(&m) {
             order.push(m.clone());
             by_mask.insert(m, p);
         }
     }
 
     // Stable sort by descending popcount.
-    order.sort_by_cached_key(|m| std::cmp::Reverse(m.count_ones().unwrap()));
+    order.sort_by_cached_key(|m| std::cmp::Reverse(m.count()));
 
-    let mut kept: Vec<Integer> = Vec::new();
+    let mut kept: Vec<Bitset> = Vec::new();
     for m in order {
-        let dominated = kept.iter().any(|k| {
-            let u: Integer = Integer::from(&m | k);
-            &u == k
-        });
-        if !dominated {
+        if !kept.iter().any(|k| m.is_subset_of(k)) {
             kept.push(m);
         }
     }
 
-    let union: Integer = kept
+    let union: Bitset = kept
         .iter()
-        .fold(Integer::from(0), |a, b| Integer::from(&a | b));
+        .fold(Bitset::empty(n_univ), |a, b| a.union(b));
     if union != full {
         return None;
     }
@@ -199,7 +260,7 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Integer, AP)>) -> Option<Vec<AP>> {
         .map(|e| {
             sets.iter()
                 .enumerate()
-                .filter_map(|(i, m)| if m.get_bit(e as u32) { Some(i) } else { None })
+                .filter_map(|(i, m)| if m.get(e) { Some(i) } else { None })
                 .collect()
         })
         .collect();
@@ -207,36 +268,35 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Integer, AP)>) -> Option<Vec<AP>> {
     // Greedy upper bound.
     let mut unc = full.clone();
     let mut chosen: Vec<usize> = Vec::new();
-    while unc != 0 {
+    while !unc.is_empty() {
         let i = (0..sets.len())
-            .max_by_key(|&i| Integer::from(&sets[i] & &unc).count_ones().unwrap())
+            .max_by_key(|&i| sets[i].intersect_count(&unc))
             .unwrap();
         chosen.push(i);
-        let common = Integer::from(&unc & &sets[i]);
-        unc -= common;
+        unc = unc.difference(&sets[i]);
     }
     let mut best = chosen;
 
-    let maxsz = sets.iter().map(|m| m.count_ones().unwrap()).max().unwrap() as usize;
-    let mut memo: HashMap<Integer, usize> = HashMap::new();
+    let maxsz = sets.iter().map(|m| m.count()).max().unwrap() as usize;
+    let mut memo: HashMap<Bitset, usize> = HashMap::new();
 
     fn dfs(
-        unc: &Integer,
+        unc: &Bitset,
         chosen: &mut Vec<usize>,
         best: &mut Vec<usize>,
-        sets: &[Integer],
+        sets: &[Bitset],
         elem_sets: &[Vec<usize>],
         n_univ: usize,
         maxsz: usize,
-        memo: &mut HashMap<Integer, usize>,
+        memo: &mut HashMap<Bitset, usize>,
     ) {
-        if unc.cmp0() == Ordering::Equal {
+        if unc.is_empty() {
             if chosen.len() < best.len() {
                 *best = chosen.clone();
             }
             return;
         }
-        let cnt = unc.count_ones().unwrap() as usize;
+        let cnt = unc.count() as usize;
         let lb = cnt.div_ceil(maxsz);
         if chosen.len() + lb >= best.len() {
             return;
@@ -251,19 +311,16 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Integer, AP)>) -> Option<Vec<AP>> {
         }
 
         let e = (0..n_univ)
-            .filter(|&e| unc.get_bit(e as u32))
+            .filter(|&e| unc.get(e))
             .min_by_key(|&e| elem_sets[e].len())
             .unwrap();
 
         let mut cand_indices = elem_sets[e].clone();
-        cand_indices.sort_by_cached_key(|&i| {
-            std::cmp::Reverse(Integer::from(&sets[i] & unc).count_ones().unwrap())
-        });
+        cand_indices.sort_by_cached_key(|&i| std::cmp::Reverse(sets[i].intersect_count(unc)));
 
         for i in cand_indices {
             chosen.push(i);
-            let intersect = Integer::from(&sets[i] & unc);
-            let new_unc = Integer::from(unc - &intersect);
+            let new_unc = unc.difference(&sets[i]);
             dfs(&new_unc, chosen, best, sets, elem_sets, n_univ, maxsz, memo);
             chosen.pop();
         }
@@ -289,35 +346,36 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Integer, AP)>) -> Option<Vec<AP>> {
 /// Minimum representation, overlap allowed.
 pub fn solve_a(inputs: &[AP]) -> Vec<AP> {
     let (f, t, p, r) = normalize(inputs);
+    let n_univ = f.len() + r.len();
     let eidx: HashMap<i64, usize> = f.iter().enumerate().map(|(i, &x)| (x, i)).collect();
     let tidx: HashMap<i64, usize> = r
         .iter()
         .enumerate()
         .map(|(i, &x)| (x, f.len() + i))
         .collect();
-    let mut cands: Vec<(Integer, AP)> = Vec::new();
+    let mut cands: Vec<(Bitset, AP)> = Vec::new();
     for (d, _b, e, coset) in infinite_candidates(&f, t, p, &r) {
-        let mut m = Integer::from(0);
+        let mut m = Bitset::empty(n_univ);
         for r_val in &coset {
-            m.set_bit(tidx[r_val] as u32, true);
+            m.insert(tidx[r_val]);
         }
         let mut x = e;
         while x < t {
-            m.set_bit(eidx[&x] as u32, true);
+            m.insert(eidx[&x]);
             x += d;
         }
         cands.push((m, (e, d, None)));
     }
     for (s, d, n) in finite_candidates(&f) {
-        let mut m = Integer::from(0);
+        let mut m = Bitset::empty(n_univ);
         let mut x = s;
         for _ in 0..n {
-            m.set_bit(eidx[&x] as u32, true);
+            m.insert(eidx[&x]);
             x += d;
         }
         cands.push((m, (s, d, Some(n))));
     }
-    set_cover(f.len() + r.len(), cands).expect("solve_a: cover infeasible")
+    set_cover(n_univ, cands).expect("solve_a: cover infeasible")
 }
 
 // -------------------------------------------------------- formulation (b)
@@ -362,21 +420,22 @@ pub fn solve_b(inputs: &[AP]) -> Vec<AP> {
             .enumerate()
             .map(|(k, &x)| (x, suffix.len() + k))
             .collect();
-        let mut cands: Vec<(Integer, AP)> = Vec::new();
+        let n_univ = suffix.len() + r.len();
+        let mut cands: Vec<(Bitset, AP)> = Vec::new();
         for &(d, b, e, ref coset) in &inf_c {
             let s0 = if e >= c { e } else { c + (b - c).rem_euclid(d) };
-            let mut m = Integer::from(0);
+            let mut m = Bitset::empty(n_univ);
             for r_val in coset {
-                m.set_bit(tidx[r_val] as u32, true);
+                m.insert(tidx[r_val]);
             }
             let mut x = s0;
             while x < t {
-                m.set_bit(eidx[&x] as u32, true);
+                m.insert(eidx[&x]);
                 x += d;
             }
             cands.push((m, (s0, d, None)));
         }
-        let tail = set_cover(suffix.len() + r.len(), cands);
+        let tail = set_cover(n_univ, cands);
         if let Some(tail) = tail {
             let blocks = greedy_runs(&f[..i]);
             let total: Vec<AP> = blocks.into_iter().chain(tail).collect();
