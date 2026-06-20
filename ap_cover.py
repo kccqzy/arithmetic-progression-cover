@@ -143,8 +143,7 @@ def set_cover(n_univ, cands):
         seen = memo.get(unc)
         if seen is not None and seen <= len(chosen):
             return
-        if len(memo) < 1_000_000:
-            memo[unc] = len(chosen)
+        memo[unc] = len(chosen)
         e = min((e for e in range(n_univ) if unc >> e & 1),
                 key=lambda e: len(elem_sets[e]))
         for i in sorted(elem_sets[e],

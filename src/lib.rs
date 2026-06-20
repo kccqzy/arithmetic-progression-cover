@@ -306,9 +306,7 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Bitset, AP)>) -> Option<Vec<AP>> {
                 return;
             }
         }
-        if memo.len() < 1_000_000 {
-            memo.insert(unc.clone(), chosen.len());
-        }
+        memo.insert(unc.clone(), chosen.len());
 
         let e = (0..n_univ)
             .filter(|&e| unc.get(e))
