@@ -6,6 +6,30 @@ use std::collections::BTreeMap;
 fn examples() -> Vec<(&'static str, Vec<AP>)> {
     vec![
         (
+            "original case 1",
+            vec![(22, 4, None), (26, 4, None)],
+        ),
+        (
+            "original case 2",
+            vec![(22, 6, None), (24, 6, None), (26, 6, None)],
+        ),
+        (
+            "original case 3",
+            vec![(22, 6, None), (26, 6, None), (28, 6, None)],
+        ),
+        (
+            "original case 4",
+            vec![(23, 2, None), (23, 4, None)],
+        ),
+        (
+            "original case 5",
+            vec![(23, 2, None), (21, 2, Some(1))],
+        ),
+        (
+            "original case 6",
+            vec![(23, 2, None), (19, 2, Some(3))],
+        ),
+        (
             "odds k>=30 with evens k>=30",
             vec![(61, 2, None), (60, 2, None)],
         ),

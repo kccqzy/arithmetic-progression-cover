@@ -288,6 +288,12 @@ def report(name, inputs):
           + "  ".join(fmt(s) for s in sorted(sb, key=lambda t: t[1])) + "\n")
 
 EXAMPLES = [
+    ("original case 1", [(22, 4, None), (26, 4, None)]),
+    ("original case 2", [(22, 6, None), (24, 6, None), (26, 6, None)]),
+    ("original case 3", [(22, 6, None), (26, 6, None), (28, 6, None)]),
+    ("original case 4", [(23, 2, None), (23, 4, None)]),
+    ("original case 5", [(23, 2, None), (21, 2, 1)]),
+    ("original case 6", [(23, 2, None), (19, 2, 3)]),
     ("odds k>=30 with evens k>=30", [(61, 2, None), (60, 2, None)]),
     ("evens >= 0 with {1, 5}", [(0, 2, None), (1, 4, 2)]),
     ("{0,7,14,21,28} with {3,7,11,15,19}", [(0, 7, 5), (3, 4, 5)]),
