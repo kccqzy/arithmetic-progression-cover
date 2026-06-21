@@ -9,8 +9,28 @@
 //!       sets A, B, either max(A) < min(B), or max(B) < min(A), or both are
 //!       infinite.
 //!
-//! This file is a faithful port of `ap_cover.py`; see that file's module
-//! docstring for the mathematical background.
+//! Method.  S normalizes to a finite prefix F = S ∩ (-inf, T) plus a periodic
+//! tail: for x >= T, x ∈ S iff x mod P ∈ R, where P = lcm of the infinite
+//! inputs' differences.
+//!
+//!   (a) becomes exact set cover over ground set F ∪ R.  Candidates: all
+//!       maximal finite APs inside F, and, for every divisor d of P and residue
+//!       class b mod d whose full lift to Z/P lies inside R, the maximal
+//!       infinite AP (left-extended through F as far as S allows).
+//!   (b) decomposes at a cut c (the earliest infinite start): the prefix
+//!       S ∩ (-inf, c) is partitioned into consecutive runs by a greedy pass
+//!       (provably optimal: any suffix of a contiguous AP run is one, so the
+//!       standard exchange argument applies), and the suffix is covered by
+//!       infinite APs only, which may overlap -- an exact set cover over
+//!       residue tokens plus the explicit elements in [c, T).  All cuts are
+//!       scanned.
+//!
+//! Modeling restriction: infinite APs in solutions use differences dividing P.
+//! Every input satisfies this (P is their lcm) and every full residue class is
+//! expressible this way; an AP with d not dividing P covers only a strict
+//! sub-progression of each class it meets, so several are needed per class.
+//! We have found no instance where such tilings beat the divisor solutions,
+//! but we do not have a proof that they never do.
 
 use std::collections::{BTreeSet, HashMap};
 
