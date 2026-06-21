@@ -66,10 +66,24 @@ impl Bitset {
         }
     }
 
+    /// In-place `self |= other`.
+    pub fn union_assign(&mut self, other: &Self) {
+        for (a, &b) in self.words.iter_mut().zip(&other.words) {
+            *a |= b;
+        }
+    }
+
     /// `self & !other` (bits in `self` not in `other`).
     pub fn difference(&self, other: &Self) -> Self {
         Self {
             words: self.words.iter().zip(&other.words).map(|(&a, &b)| a & !b).collect(),
+        }
+    }
+
+    /// In-place `self &= !other`.
+    pub fn subtract_assign(&mut self, other: &Self) {
+        for (a, &b) in self.words.iter_mut().zip(&other.words) {
+            *a &= !b;
         }
     }
 
@@ -81,6 +95,12 @@ impl Bitset {
     /// `(self & other).count()`, without allocating the intersection.
     pub fn intersect_count(&self, other: &Self) -> u32 {
         self.words.iter().zip(&other.words).map(|(&a, &b)| (a & b).count_ones()).sum()
+    }
+
+    /// Overwrite `self` with `other`'s bits in place, reusing the existing
+    /// allocation.  Both bitsets must share the same word count.
+    pub fn copy_from(&mut self, other: &Self) {
+        self.words.copy_from_slice(&other.words);
     }
 }
 
@@ -229,11 +249,11 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Bitset, AP)>) -> Option<Vec<AP>> {
     }
 
     // First occurrence of each non-zero mask wins, preserving insertion order.
-    let mut by_mask: HashMap<Bitset, AP> = HashMap::new();
-    let mut order: Vec<Bitset> = Vec::new();
-    for (m, p) in cands {
+    let mut by_mask: HashMap<&Bitset, &AP> = HashMap::new();
+    let mut order: Vec<&Bitset> = Vec::new();
+    for (ref m, ref p) in cands.iter() {
         if !m.is_empty() && !by_mask.contains_key(&m) {
-            order.push(m.clone());
+            order.push(m);
             by_mask.insert(m, p);
         }
     }
@@ -241,16 +261,17 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Bitset, AP)>) -> Option<Vec<AP>> {
     // Stable sort by descending popcount.
     order.sort_by_cached_key(|m| std::cmp::Reverse(m.count()));
 
-    let mut kept: Vec<Bitset> = Vec::new();
+    let mut kept: Vec<&Bitset> = Vec::new();
     for m in order {
         if !kept.iter().any(|k| m.is_subset_of(k)) {
             kept.push(m);
         }
     }
 
-    let union: Bitset = kept
-        .iter()
-        .fold(Bitset::empty(n_univ), |a, b| a.union(b));
+    let mut union = Bitset::empty(n_univ);
+    for k in &kept {
+        union.union_assign(k);
+    }
     if union != full {
         return None;
     }
@@ -273,7 +294,7 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Bitset, AP)>) -> Option<Vec<AP>> {
             .max_by_key(|&i| sets[i].intersect_count(&unc))
             .unwrap();
         chosen.push(i);
-        unc = unc.difference(&sets[i]);
+        unc.subtract_assign(sets[i]);
     }
     let mut best = chosen;
 
@@ -281,10 +302,10 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Bitset, AP)>) -> Option<Vec<AP>> {
     let mut memo: HashMap<Bitset, usize> = HashMap::new();
 
     fn dfs(
-        unc: &Bitset,
+        unc: &mut Bitset,
         chosen: &mut Vec<usize>,
         best: &mut Vec<usize>,
-        sets: &[Bitset],
+        sets: &[&Bitset],
         elem_sets: &[Vec<usize>],
         n_univ: usize,
         maxsz: usize,
@@ -313,20 +334,26 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Bitset, AP)>) -> Option<Vec<AP>> {
             .min_by_key(|&e| elem_sets[e].len())
             .unwrap();
 
-        let mut cand_indices = elem_sets[e].clone();
-        cand_indices.sort_by_cached_key(|&i| std::cmp::Reverse(sets[i].intersect_count(unc)));
+        let mut keyed: Vec<(u32, usize)> = elem_sets[e]
+            .iter()
+            .map(|&i| (sets[i].intersect_count(unc), i))
+            .collect();
+        keyed.sort_by_key(|&(k, _)| std::cmp::Reverse(k));
 
-        for i in cand_indices {
+        let snapshot = unc.clone();
+        for (_, i) in keyed {
             chosen.push(i);
-            let new_unc = unc.difference(&sets[i]);
-            dfs(&new_unc, chosen, best, sets, elem_sets, n_univ, maxsz, memo);
+            unc.subtract_assign(sets[i]);
+            dfs(unc, chosen, best, sets, elem_sets, n_univ, maxsz, memo);
             chosen.pop();
+            unc.copy_from(&snapshot);
         }
     }
 
+    let mut unc = full.clone();
     let mut chosen2 = Vec::new();
     dfs(
-        &full,
+        &mut unc,
         &mut chosen2,
         &mut best,
         &sets,
@@ -336,7 +363,7 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Bitset, AP)>) -> Option<Vec<AP>> {
         &mut memo,
     );
 
-    Some(best.iter().map(|&i| by_mask[&sets[i]]).collect())
+    Some(best.iter().map(|&i| by_mask[&sets[i]]).copied().collect())
 }
 
 // -------------------------------------------------------- formulation (a)
