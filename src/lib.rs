@@ -209,6 +209,9 @@ pub fn divisors(p: i64) -> Vec<i64> {
 
 /// Maximal infinite APs inside S with difference dividing P, as
 /// `(d, b, e, coset)`: difference, class mod d, leftmost start, residues.
+/// Bitset-dominated candidates (relative to those already accepted) are
+/// skipped during generation: with prime-period inputs we would otherwise
+/// materialize ~sigma_1(P) candidates, most of them redundant.
 pub fn infinite_candidates(
     f: &BTreeSet<i64>,
     t: i64,
@@ -218,13 +221,18 @@ pub fn infinite_candidates(
     let mut out = Vec::new();
     for d in divisors(p) {
         for b in 0..d {
+            let mut e = t + (b - t).rem_euclid(d); // least element >= T in class
+            while f.contains(&(e - d)) {
+                // extend left through prefix
+                e -= d;
+            }
+            if out.iter().any(|&(dp, bp, ep, _)| {
+                d % dp == 0 && b % dp == bp && e >= ep
+            }) {
+                continue; // bitset-dominated
+            }
             let coset: Vec<i64> = (0..p / d).map(|k| b + k * d).collect();
             if coset.iter().all(|x| r.contains(x)) {
-                let mut e = t + (b - t).rem_euclid(d); // least element >= T in class
-                while f.contains(&(e - d)) {
-                    // extend left through prefix
-                    e -= d;
-                }
                 out.push((d, b, e, coset));
             }
         }

@@ -74,15 +74,21 @@ def divisors(P):
 
 def infinite_candidates(F_set, T, P, R):
     """Maximal infinite APs inside S with difference dividing P, as
-    (d, b, e, coset): difference, class mod d, leftmost start, residues."""
+    (d, b, e, coset): difference, class mod d, leftmost start, residues.
+    Bitset-dominated candidates (relative to those already accepted) are
+    skipped during generation: with prime-period inputs we would otherwise
+    materialize ~sigma_1(P) candidates, most of them redundant."""
     out = []
     for d in divisors(P):
         for b in range(d):
+            e = T + (b - T) % d            # least element >= T in the class
+            while e - d in F_set:          # extend left through the prefix
+                e -= d
+            if any(d % dp == 0 and b % dp == bp and e >= ep
+                   for dp, bp, ep, _ in out):
+                continue                   # bitset-dominated
             coset = frozenset(range(b, P, d))
             if coset <= R:
-                e = T + (b - T) % d        # least element >= T in the class
-                while e - d in F_set:      # extend left through the prefix
-                    e -= d
                 out.append((d, b, e, coset))
     return out
 
@@ -303,6 +309,7 @@ EXAMPLES = [
      [(0, 4, None), (2, 4, None), (1, 2, None), (5, 8, 3)]),
     ("class with an interior gap", [(0, 4, None), (2, 4, 2)]),
     ("complicated 1", [(5, 1, 11), (5, 6, 12), (7, 5, 19), (-9, 3, 13), (-7, 4, 20), (-4, 5, 13), (-5, 6, 12), (-1, 6, 11), (-2, 6, 5)]),
+    ("all primes", [(2, 5, None), (2, 7, None), (2, 11, None), (2, 13, None), (2, 17, None), (2, 19, None)]),
 ]
 
 def random_instance(rng):
