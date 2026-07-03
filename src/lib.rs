@@ -11,28 +11,39 @@
 //!
 //! Method.  S normalizes to a finite prefix F = S ∩ (-inf, T) plus a periodic
 //! tail: for x >= T, x ∈ S iff x mod P ∈ R, where P = lcm of the infinite
-//! inputs' differences.
+//! inputs' differences.  R is represented as a byte indicator array Rb of
+//! length P, never as a per-residue collection.
 //!
-//!   (a) becomes exact set cover over ground set F ∪ R.  Candidates: all
-//!       maximal finite APs inside F, and, for every divisor d of P and residue
-//!       class b mod d whose full lift to Z/P lies inside R, the maximal
-//!       infinite AP (left-extended through F as far as S allows).
-//!   (b) decomposes at a cut c (the earliest infinite start): the prefix
-//!       S ∩ (-inf, c) is partitioned into consecutive runs by a greedy pass
-//!       (provably optimal: any suffix of a contiguous AP run is one, so the
-//!       standard exchange argument applies), and the suffix is covered by
-//!       infinite APs only, which may overlap -- an exact set cover over
-//!       residue tokens plus the explicit elements in [c, T).  All cuts are
+//!   (a) becomes exact set cover over ground set F plus tail tokens.
+//!   (b) decomposes at a cut c (the earliest infinite start): the prefix is
+//!       partitioned into consecutive runs by a greedy pass (provably
+//!       optimal), the suffix is covered by infinite APs only; all cuts are
 //!       scanned.
 //!
+//! Scalability.  Large periods are kept tractable by working on whole arrays:
+//!   1. Valid residue classes (b mod d whose full lift to Z/P lies in R) are
+//!      computed for all divisors d of P by DP down the divisor lattice: the
+//!      validity array at level d is the byte-wise AND of the q chunks of
+//!      the array at level d*q.
+//!   2. Dominated candidates are pruned wholesale.  Candidate (d,b,e) is
+//!      dominated by (dp,bp,ep) when dp | d, b ≡ bp (mod dp) and e >= ep.
+//!      For classes that do not extend into the prefix (e >= T), e >= ep
+//!      holds automatically, so the dominance mask at level d is the OR over
+//!      primes q | d of the tiled validity array of level d/q.  The few
+//!      classes that do extend into the prefix (at most |F| per divisor) are
+//!      checked individually against actual starts.
+//!   3. The tail ground set is compressed by coverage signature: residues of
+//!      R covered by exactly the same candidates are one token, so the
+//!      set-cover universe is the number of distinct signatures, not |R|.
+//!
 //! Modeling restriction: infinite APs in solutions use differences dividing P.
-//! Every input satisfies this (P is their lcm) and every full residue class is
-//! expressible this way; an AP with d not dividing P covers only a strict
-//! sub-progression of each class it meets, so several are needed per class.
-//! We have found no instance where such tilings beat the divisor solutions,
-//! but we do not have a proof that they never do.
+//! Every input satisfies this and every full residue class is expressible
+//! this way; an AP with d not dividing P covers only a strict
+//! sub-progression of each class it meets.  We have found no instance where
+//! such tilings beat the divisor solutions, but we do not have a proof that
+//! they never do.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// (s, d, n): start, difference, count.  `n = None` means an infinite AP.
 pub type AP = (i64, i64, Option<i64>);
@@ -140,8 +151,9 @@ pub fn lcm(a: i64, b: i64) -> i64 {
     a / gcd(a, b) * b
 }
 
-/// Return `(F, T, P, R)`: sorted prefix, threshold, period, tail residues.
-pub fn normalize(inputs: &[AP]) -> (BTreeSet<i64>, i64, i64, BTreeSet<i64>) {
+/// Return `(F, T, P, Rb)`: sorted prefix, threshold, period, and the tail
+/// residue indicator (`Rb[r] == 1` iff residue `r mod P` belongs to S's tail).
+pub fn normalize(inputs: &[AP]) -> (BTreeSet<i64>, i64, i64, Vec<u8>) {
     assert!(!inputs.is_empty());
     for &(_, d, n) in inputs {
         assert!(d >= 1 && n.is_none_or(|n| n >= 1));
@@ -154,23 +166,25 @@ pub fn normalize(inputs: &[AP]) -> (BTreeSet<i64>, i64, i64, BTreeSet<i64>) {
         .iter()
         .filter_map(|&(s, d, n)| n.map(|nn| (s, d, nn)))
         .collect();
-    let (p, t, r): (i64, i64, BTreeSet<i64>) = if !infs.is_empty() {
+    let (p, t, rb): (i64, i64, Vec<u8>) = if !infs.is_empty() {
         let p = infs.iter().map(|&(_, d)| d).fold(1, lcm);
         let mut t = infs.iter().map(|&(s, _)| s).max().unwrap();
         if !fins.is_empty() {
             let max_fin = fins.iter().map(|&(s, d, n)| s + (n - 1) * d).max().unwrap();
             t = t.max(1 + max_fin);
         }
-        let mut r: BTreeSet<i64> = BTreeSet::new();
+        let mut rb = vec![0u8; p as usize];
         for &(s, d) in &infs {
-            for k in 0..p / d {
-                r.insert((s + k * d).rem_euclid(p));
+            let mut r = s.rem_euclid(d) as usize;
+            while r < p as usize {
+                rb[r] = 1;
+                r += d as usize;
             }
         }
-        (p, t, r)
+        (p, t, rb)
     } else {
         let max_fin = fins.iter().map(|&(s, d, n)| s + (n - 1) * d).max().unwrap();
-        (1, 1 + max_fin, BTreeSet::new())
+        (1, 1 + max_fin, vec![0u8; 1])
     };
     let mut f: BTreeSet<i64> = BTreeSet::new();
     for &(s, d, n) in &fins {
@@ -189,12 +203,12 @@ pub fn normalize(inputs: &[AP]) -> (BTreeSet<i64>, i64, i64, BTreeSet<i64>) {
             x += d;
         }
     }
-    (f, t, p, r)
+    (f, t, p, rb)
 }
 
 // -------------------------------------------------------------- candidates
 
-pub fn divisors(p: i64) -> Vec<i64> {
+pub fn divisors(p: i64) -> BTreeSet<i64> {
     let mut out: BTreeSet<i64> = BTreeSet::new();
     let mut d: i64 = 1;
     while d * d <= p {
@@ -204,49 +218,188 @@ pub fn divisors(p: i64) -> Vec<i64> {
         }
         d += 1;
     }
-    out.into_iter().collect()
+    out
 }
 
-/// Maximal infinite APs inside S with difference dividing P, as
-/// `(d, b, e, coset)`: difference, class mod d, leftmost start, residues.
-/// Bitset-dominated candidates (relative to those already accepted) are
-/// skipped during generation: with prime-period inputs we would otherwise
-/// materialize ~sigma_1(P) candidates, most of them redundant.
+pub fn prime_factors(mut n: i64) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut p: i64 = 2;
+    while p * p <= n {
+        if n % p == 0 {
+            out.push(p);
+            while n % p == 0 {
+                n /= p;
+            }
+        }
+        p += 1;
+    }
+    if n > 1 {
+        out.push(n);
+    }
+    out
+}
+
+/// `flags[d][b] == 1` iff the full lift of `b mod d` to Z/P lies inside R,
+/// for every divisor d of P.  DP down the divisor lattice: the array at d
+/// is the byte-wise AND of the q chunks of the array at d*q (any prime q
+/// dividing P/d).
+pub fn valid_classes(p: i64, rb: &[u8]) -> BTreeMap<i64, Vec<u8>> {
+    let mut flags: BTreeMap<i64, Vec<u8>> = BTreeMap::new();
+    flags.insert(p, rb.to_vec());
+    for d in divisors(p).into_iter().rev().skip(1) {
+        let q = prime_factors(p / d)[0];
+        let d_usz = d as usize;
+        let q_usz = q as usize;
+        let par = flags[&(d * q)].clone();
+        let mut v = par[..d_usz].to_vec();
+        for k in 1..q_usz {
+            let chunk = &par[k * d_usz..(k + 1) * d_usz];
+            for i in 0..d_usz {
+                v[i] &= chunk[i];
+            }
+        }
+        flags.insert(d, v);
+    }
+    flags
+}
+
+/// Leftmost start of the AP with difference `d` in class `b mod d`,
+/// extended leftward through F.
+fn class_start(
+    d: i64,
+    b: i64,
+    t: i64,
+    f: &BTreeSet<i64>,
+    e_memo: &mut HashMap<(i64, i64), i64>,
+) -> i64 {
+    if let Some(&e) = e_memo.get(&(d, b)) {
+        return e;
+    }
+    let mut e = t + (b - t).rem_euclid(d);
+    while f.contains(&(e - d)) {
+        e -= d;
+    }
+    e_memo.insert((d, b), e);
+    e
+}
+
+/// Non-dominated maximal infinite APs inside S with difference dividing P,
+/// as `(d, b, e)`: difference, class mod d, leftmost start.
 pub fn infinite_candidates(
     f: &BTreeSet<i64>,
     t: i64,
     p: i64,
-    r: &BTreeSet<i64>,
-) -> Vec<(i64, i64, i64, Vec<i64>)> {
-    let mut out = Vec::new();
-    for d in divisors(p) {
-        for b in 0..d {
-            let mut e = t + (b - t).rem_euclid(d); // least element >= T in class
-            while f.contains(&(e - d)) {
-                // extend left through prefix
-                e -= d;
+    rb: &[u8],
+) -> Vec<(i64, i64, i64)> {
+    let flags = valid_classes(p, rb);
+    let mut e_memo: HashMap<(i64, i64), i64> = HashMap::new();
+    let mut out: Vec<(i64, i64, i64)> = Vec::new();
+    // Descending divisor order matches Python's insertion-order dict iteration.
+    for (&d, flags_d) in flags.iter().rev() {
+        let d_usz = d as usize;
+        // classes whose chain can extend into the prefix (at most |F|)
+        let mut ext: BTreeSet<i64> = BTreeSet::new();
+        for &y in f.iter() {
+            if y >= t - d {
+                ext.insert(y.rem_euclid(d));
             }
-            if out.iter().any(|&(dp, bp, ep, _)| {
-                d % dp == 0 && b % dp == bp && e >= ep
-            }) {
-                continue; // bitset-dominated
+        }
+        // dom[b] = 1 iff some prime q | d has (d/q, b mod (d/q)) valid.
+        let mut dom = vec![0u8; d_usz];
+        for q in prime_factors(d) {
+            let dp = d / q;
+            let dp_usz = dp as usize;
+            let q_usz = q as usize;
+            let src = &flags[&dp];
+            for k in 0..q_usz {
+                let dst = &mut dom[k * dp_usz..(k + 1) * dp_usz];
+                for i in 0..dp_usz {
+                    dst[i] |= src[i];
+                }
             }
-            let coset: Vec<i64> = (0..p / d).map(|k| b + k * d).collect();
-            if coset.iter().all(|x| r.contains(x)) {
-                out.push((d, b, e, coset));
+        }
+        // Unextendable survivors: valid and not dominated at the byte level.
+        for b in 0..d_usz {
+            if flags_d[b] & !dom[b] != 0 {
+                let b_i = b as i64;
+                if !ext.contains(&b_i) {
+                    let e = class_start(d, b_i, t, f, &mut e_memo);
+                    out.push((d, b_i, e));
+                }
+            }
+        }
+        // Extendable classes: exact per-divisor dominance test.
+        let divs = divisors(d);
+        let proper_divs = divs.iter().rev().skip(1).rev();
+        for &b in ext.iter() {
+            if flags_d[b as usize] != 0 {
+                let e = class_start(d, b, t, f, &mut e_memo);
+                let mut dominated = false;
+                for &dp in proper_divs.clone() {
+                    let bp = b.rem_euclid(dp);
+                    if flags[&dp][bp as usize] != 0
+                        && e >= class_start(dp, bp, t, f, &mut e_memo)
+                    {
+                        dominated = true;
+                        break;
+                    }
+                }
+                if !dominated {
+                    out.push((d, b, e));
+                }
             }
         }
     }
     out
 }
 
+/// Coverage-signature compression of the tail: residues of R covered by
+/// exactly the same candidates are one token.  Returns the sorted list of
+/// distinct masks; bit i of a mask marks coverage by candidate i.
+pub fn tail_tokens(cands: &[(i64, i64, i64)], p: i64, _rb: &[u8]) -> Vec<u64> {
+    if cands.is_empty() {
+        return Vec::new();
+    }
+    assert!(cands.len() <= 64, "tail_tokens: >64 candidates not supported");
+    let p_usz = p as usize;
+    let mut cover: Vec<u64> = vec![0u64; p_usz];
+    for (i, &(d, b, _)) in cands.iter().enumerate() {
+        let mut r = b as usize;
+        while r < p_usz {
+            cover[r] |= 1u64 << i;
+            r += d as usize;
+        }
+    }
+    cover.retain(|&c| c != 0);
+    cover.sort_unstable();
+    cover.dedup();
+    cover
+}
+
+/// For each candidate, the set of tokens it covers, packed as a Bitset of
+/// `toks.len()` bits.
+pub fn token_masks(inf_c: &[(i64, i64, i64)], toks: &[u64]) -> Vec<Bitset> {
+    let n = inf_c.len();
+    let n_toks = toks.len();
+    let mut tmask: Vec<Bitset> = (0..n).map(|_| Bitset::empty(n_toks)).collect();
+    for (j, &t) in toks.iter().enumerate() {
+        for (i, tm) in tmask.iter_mut().enumerate() {
+            if (t >> i) & 1 != 0 {
+                tm.insert(j);
+            }
+        }
+    }
+    tmask
+}
+
 /// Maximal APs (including singletons) contained in F, as `(s, d, n)`.
-pub fn finite_candidates(f: &BTreeSet<i64>) -> Vec<(i64, i64, i64)> {
+pub fn finite_candidates(f: &BTreeSet<i64>) -> BTreeSet<(i64, i64, i64)> {
     let mut out: BTreeSet<(i64, i64, i64)> = BTreeSet::new();
     for &x in f {
         out.insert((x, 1, 1));
     }
     for (i, s) in f.iter().copied().enumerate() {
+
         for t in f.iter().skip(i + 1)  {
             let d = t - s;
             if f.contains(&(s - d)) {
@@ -262,7 +415,7 @@ pub fn finite_candidates(f: &BTreeSet<i64>) -> Vec<(i64, i64, i64)> {
             out.insert((s, d, n));
         }
     }
-    out.into_iter().collect()
+    out
 }
 
 // ----------------------------------------------------------- exact cover(s)
@@ -398,19 +551,21 @@ pub fn set_cover(n_univ: usize, cands: Vec<(Bitset, AP)>) -> Option<Vec<AP>> {
 
 /// Minimum representation, overlap allowed.
 pub fn solve_a(inputs: &[AP]) -> Vec<AP> {
-    let (f, t, p, r) = normalize(inputs);
-    let n_univ = f.len() + r.len();
+    let (f, t, p, rb) = normalize(inputs);
+    let inf_c = infinite_candidates(&f, t, p, &rb);
+    let toks = tail_tokens(&inf_c, p, &rb);
+    let tmask = token_masks(&inf_c, &toks);
+    let n_f = f.len();
+    let n_toks = toks.len();
+    let n_univ = n_f + n_toks;
     let eidx: HashMap<i64, usize> = f.iter().enumerate().map(|(i, &x)| (x, i)).collect();
-    let tidx: HashMap<i64, usize> = r
-        .iter()
-        .enumerate()
-        .map(|(i, &x)| (x, f.len() + i))
-        .collect();
     let mut cands: Vec<(Bitset, AP)> = Vec::new();
-    for (d, _b, e, coset) in infinite_candidates(&f, t, p, &r) {
+    for (i, &(d, _b, e)) in inf_c.iter().enumerate() {
         let mut m = Bitset::empty(n_univ);
-        for r_val in &coset {
-            m.insert(tidx[r_val]);
+        for j in 0..n_toks {
+            if tmask[i].get(j) {
+                m.insert(n_f + j);
+            }
         }
         let mut x = e;
         while x < t {
@@ -456,30 +611,30 @@ pub fn greedy_runs(f: &[i64]) -> Vec<AP> {
 
 /// Minimum representation under the non-overlap rule.
 pub fn solve_b(inputs: &[AP]) -> Vec<AP> {
-    let (f, t, p, r) = normalize(inputs);
-    if r.is_empty() {
-        let f: Vec<i64> = f.iter().copied().collect();
-        return greedy_runs(&f);
+    let (f, t, p, rb) = normalize(inputs);
+    let f_vec: Vec<i64> = f.iter().copied().collect();
+    if !rb.iter().any(|&x| x != 0) {
+        return greedy_runs(&f_vec);
     }
-    let inf_c = infinite_candidates(&f, t, p, &r);
-    let f: Vec<i64> = f.iter().copied().collect();
+    let inf_c = infinite_candidates(&f, t, p, &rb);
+    let toks = tail_tokens(&inf_c, p, &rb);
+    let tmask = token_masks(&inf_c, &toks);
+    let n_toks = toks.len();
     let mut best: Option<Vec<AP>> = None;
-    for i in 0..=f.len() {
-        let c = if i < f.len() { f[i] } else { t };
-        let suffix = &f[i..];
+    for i in 0..=f_vec.len() {
+        let c = if i < f_vec.len() { f_vec[i] } else { t };
+        let suffix = &f_vec[i..];
         let eidx: HashMap<i64, usize> = suffix.iter().enumerate().map(|(k, &x)| (x, k)).collect();
-        let tidx: HashMap<i64, usize> = r
-            .iter()
-            .enumerate()
-            .map(|(k, &x)| (x, suffix.len() + k))
-            .collect();
-        let n_univ = suffix.len() + r.len();
+        let n_s = suffix.len();
+        let n_univ = n_s + n_toks;
         let mut cands: Vec<(Bitset, AP)> = Vec::new();
-        for &(d, b, e, ref coset) in &inf_c {
+        for (ci, &(d, b, e)) in inf_c.iter().enumerate() {
             let s0 = if e >= c { e } else { c + (b - c).rem_euclid(d) };
             let mut m = Bitset::empty(n_univ);
-            for r_val in coset {
-                m.insert(tidx[r_val]);
+            for j in 0..n_toks {
+                if tmask[ci].get(j) {
+                    m.insert(n_s + j);
+                }
             }
             let mut x = s0;
             while x < t {
@@ -489,11 +644,11 @@ pub fn solve_b(inputs: &[AP]) -> Vec<AP> {
             cands.push((m, (s0, d, None)));
         }
         let tail = set_cover(n_univ, cands);
-        if let Some(tail) = tail {
-            let blocks = greedy_runs(&f[..i]);
-            let total: Vec<AP> = blocks.into_iter().chain(tail).collect();
-            if best.as_ref().is_none_or(|b| total.len() < b.len()) {
-                best = Some(total);
+        if let Some(mut tail) = tail {
+            let mut blocks = greedy_runs(&f_vec[..i]);
+            if best.as_ref().is_none_or(|b| blocks.len() + tail.len() < b.len()) {
+                blocks.append(&mut tail);
+                best = Some(blocks);
             }
         }
     }
@@ -512,12 +667,13 @@ pub fn ap_contains(st: &AP, x: i64) -> bool {
 }
 
 pub fn verify(inputs: &[AP], sol: &[AP], rule_b: bool) {
-    let (f, t, p, r) = normalize(inputs);
+    let (f, t, p, rb) = normalize(inputs);
+    let p_usz = p as usize;
     let mem = |x: i64| -> bool {
         if x < t {
             f.contains(&x)
         } else {
-            r.contains(&x.rem_euclid(p))
+            rb[x.rem_euclid(p) as usize] != 0
         }
     };
     for st in sol {
@@ -531,12 +687,15 @@ pub fn verify(inputs: &[AP], sol: &[AP], rule_b: bool) {
         } else {
             assert!(p % d == 0, "{:?}", st);
             let mut x = s;
-            while x < t + p {
+            while x < t {
                 assert!(mem(x), "{:?}", st);
                 x += d;
             }
-            for k in 0..p / d {
-                assert!(r.contains(&(s + k * d).rem_euclid(p)), "{:?}", st);
+            // tail class fully inside R
+            let mut r = s.rem_euclid(d) as usize;
+            while r < p_usz {
+                assert!(rb[r] != 0, "{:?}", st);
+                r += d as usize;
             }
         }
     }
@@ -544,18 +703,25 @@ pub fn verify(inputs: &[AP], sol: &[AP], rule_b: bool) {
         // prefix fully covered
         assert!(sol.iter().any(|st| ap_contains(st, x)), "{}", x);
     }
-    for &rv in &r {
-        // each tail class owned fully
-        assert!(
-            sol.iter().any(|&(s, d, n)| {
-                n.is_none() && rv.rem_euclid(d) == s.rem_euclid(d)
-            }),
-            "{}",
-            rv
-        );
+    // every tail class of R owned by some infinite pick
+    let mut cov = vec![0u8; p_usz];
+    for &(s, d, n) in sol {
+        if n.is_none() {
+            let mut r = s.rem_euclid(d) as usize;
+            while r < p_usz {
+                cov[r] = 1;
+                r += d as usize;
+            }
+        }
     }
-    for x in t..t + 2 * p {
-        // spot-check the seam
+    for i in 0..p_usz {
+        if rb[i] != 0 {
+            assert!(cov[i] != 0, "residue {} uncovered", i);
+        }
+    }
+    // spot-check the seam, capped to 2000 positions
+    let w = p.min(1000);
+    for x in t..t + 2 * w {
         assert!(
             mem(x) == sol.iter().any(|st| ap_contains(st, x)),
             "{}",

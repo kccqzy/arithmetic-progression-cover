@@ -67,9 +67,13 @@ fn examples() -> Vec<(&'static str, Vec<AP>)> {
             vec![(5, 1, Some(11)), (5, 6, Some(12)), (7, 5, Some(19)), (-9, 3, Some(13)), (-7, 4, Some(20)), (-4, 5, Some(13)), (-5, 6, Some(12)), (-1, 6, Some(11)), (-2, 6, Some(5))]
         ),
         (
-            "all primes",
+            "all primes 6",
             vec![(2, 5, None), (2, 7, None), (2, 11, None), (2, 13, None), (2, 17, None), (2, 19, None)],
-        )
+        ),
+        (
+            "all primes 7",
+            vec![(2, 5, None), (2, 7, None), (2, 11, None), (2, 13, None), (2, 17, None), (2, 19, None), (2, 23, None)],
+        ),
     ]
 }
 
