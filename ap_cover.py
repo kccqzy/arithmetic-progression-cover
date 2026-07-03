@@ -11,38 +11,59 @@ Given input APs whose union is S, we compute:
 
 Method.  S normalizes to a finite prefix F = S ∩ (-inf, T) plus a periodic
 tail: for x >= T, x ∈ S iff x mod P ∈ R, where P = lcm of the infinite
-inputs' differences.
+inputs' differences.  R is represented as a byte indicator array Rb of
+length P, never as a per-residue collection.
 
-  (a) becomes exact set cover over ground set F ∪ R.  Candidates: all
-      maximal finite APs inside F, and, for every divisor d of P and residue
-      class b mod d whose full lift to Z/P lies inside R, the maximal
-      infinite AP (left-extended through F as far as S allows).
-  (b) decomposes at a cut c (the earliest infinite start): the prefix
-      S ∩ (-inf, c) is partitioned into consecutive runs by a greedy pass
-      (provably optimal: any suffix of a contiguous AP run is one, so the
-      standard exchange argument applies), and the suffix is covered by
-      infinite APs only, which may overlap -- an exact set cover over
-      residue tokens plus the explicit elements in [c, T).  All cuts are
-      scanned.
+  (a) becomes exact set cover over ground set F plus tail tokens.
+  (b) decomposes at a cut c (the earliest infinite start): the prefix is
+      partitioned into consecutive runs by a greedy pass (provably optimal),
+      the suffix is covered by infinite APs only; all cuts are scanned.
+
+Scalability.  Large periods are kept tractable by working on whole arrays:
+  1. Valid residue classes (b mod d whose full lift to Z/P lies in R) are
+     computed for all divisors d of P by DP down the divisor lattice: the
+     validity array at level d is the byte-wise AND of the q chunks of the
+     array at level d*q.  Byte-wise AND/OR run at C speed through integer
+     arithmetic on the underlying bytes.
+  2. Dominated candidates are pruned wholesale.  Candidate (d,b,e) is
+     dominated by (dp,bp,ep) when dp | d, b ≡ bp (mod dp) and e >= ep: its
+     residue classes and its prefix coverage are then subsets of the coarser
+     candidate's, under every cut.  Dominance is transitive, so it suffices
+     that some valid coarser class dominates.  For classes that do not
+     extend into the prefix (e >= T), e >= ep holds automatically, so the
+     dominance mask at level d is the OR over primes q | d of the tiled
+     validity array of level d/q.  The few classes that do extend into the
+     prefix (at most |F| per divisor) are checked individually against
+     actual starts.
+  3. The tail ground set is compressed by coverage signature: residues of R
+     covered by exactly the same candidates are one token.  Signatures are
+     assembled in candidate-bit byte planes and deduplicated through a
+     memoryview cast, so the set-cover universe is the number of distinct
+     signatures, not |R|.
 
 Modeling restriction: infinite APs in solutions use differences dividing P.
-Every input satisfies this (P is their lcm) and every full residue class is
-expressible this way; an AP with d not dividing P covers only a strict
-sub-progression of each class it meets, so several are needed per class.
-We have found no instance where such tilings beat the divisor solutions,
-but we do not have a proof that they never do.
+Every input satisfies this and every full residue class is expressible this
+way; an AP with d not dividing P covers only a strict sub-progression of
+each class it meets.  We have found no instance where such tilings beat the
+divisor solutions, but we do not have a proof that they never do.
 """
+import sys
+import random
 from math import gcd
 from functools import reduce
-import random
 
 # ----------------------------------------------------------- normalization
 
 def lcm(a, b):
     return a * b // gcd(a, b)
 
+def class_ones(b, P, d):
+    """Indicator segment for the class b mod d inside [0, P)."""
+    return b"\x01" * len(range(b, P, d))
+
 def normalize(inputs):
-    """Return (F, T, P, R): sorted prefix, threshold, period, tail residues."""
+    """Return (F, T, P, Rb): sorted prefix, threshold, period, and the tail
+    residue indicator (Rb[r] == 1 iff residue r mod P belongs to S's tail)."""
     assert inputs and all(d >= 1 and (n is None or n >= 1) for _, d, n in inputs)
     infs = [(s, d) for s, d, n in inputs if n is None]
     fins = [(s, d, n) for s, d, n in inputs if n is not None]
@@ -51,16 +72,18 @@ def normalize(inputs):
         T = max(s for s, _ in infs)
         if fins:
             T = max(T, 1 + max(s + (n - 1) * d for s, d, n in fins))
-        R = frozenset((s + k * d) % P for s, d in infs for k in range(P // d))
+        Rb = bytearray(P)
+        for s, d in infs:
+            Rb[s % d::d] = class_ones(s % d, P, d)
     else:
-        P, R = 1, frozenset()
+        P, Rb = 1, bytearray(1)
         T = 1 + max(s + (n - 1) * d for s, d, n in fins)
     F = set()
     for s, d, n in fins:
         F.update(x for x in range(s, s + n * d, d) if x < T)
     for s, d in infs:
         F.update(range(s, T, d))
-    return sorted(F), T, P, R
+    return sorted(F), T, P, Rb
 
 # -------------------------------------------------------------- candidates
 
@@ -72,25 +95,102 @@ def divisors(P):
         d += 1
     return sorted(out)
 
-def infinite_candidates(F_set, T, P, R):
-    """Maximal infinite APs inside S with difference dividing P, as
-    (d, b, e, coset): difference, class mod d, leftmost start, residues.
-    Bitset-dominated candidates (relative to those already accepted) are
-    skipped during generation: with prime-period inputs we would otherwise
-    materialize ~sigma_1(P) candidates, most of them redundant."""
-    out = []
-    for d in divisors(P):
-        for b in range(d):
-            e = T + (b - T) % d            # least element >= T in the class
-            while e - d in F_set:          # extend left through the prefix
-                e -= d
-            if any(d % dp == 0 and b % dp == bp and e >= ep
-                   for dp, bp, ep, _ in out):
-                continue                   # bitset-dominated
-            coset = frozenset(range(b, P, d))
-            if coset <= R:
-                out.append((d, b, e, coset))
+def prime_factors(n):
+    out, p = [], 2
+    while p * p <= n:
+        if n % p == 0:
+            out.append(p)
+            while n % p == 0:
+                n //= p
+        p += 1
+    if n > 1:
+        out.append(n)
     return out
+
+def valid_classes(P, Rb):
+    """flags[d][b] == 1 iff the full lift of b mod d to Z/P lies inside R,
+    for every divisor d of P.  DP down the divisor lattice: the array at d
+    is the byte-wise AND of the q chunks of the array at d*q (any prime q
+    dividing P/d), performed as integer arithmetic on the bytes."""
+    flags = {P: bytes(Rb)}
+    for d in sorted(divisors(P), reverse=True)[1:]:
+        q = prime_factors(P // d)[0]
+        par = flags[d * q]
+        v = int.from_bytes(par[:d], "little")
+        for k in range(1, q):
+            v &= int.from_bytes(par[k * d:(k + 1) * d], "little")
+        flags[d] = v.to_bytes(d, "little")
+    return flags
+
+def infinite_candidates(F_set, T, P, Rb):
+    """Non-dominated maximal infinite APs inside S with difference dividing
+    P, as (d, b, e): difference, class mod d, leftmost start."""
+    flags = valid_classes(P, Rb)
+    e_memo = {}
+
+    def start(d, b):
+        e = e_memo.get((d, b))
+        if e is None:
+            e = T + (b - T) % d
+            while e - d in F_set:
+                e -= d
+            e_memo[(d, b)] = e
+        return e
+
+    out = []
+    for d in flags:
+        # classes whose chain can extend into the prefix (at most |F|)
+        ext = {y % d for y in F_set if y >= T - d}
+        dom = 0
+        for q in prime_factors(d):
+            dom |= int.from_bytes(flags[d // q] * q, "little")
+        surv = (int.from_bytes(flags[d], "little") & ~dom).to_bytes(d, "little")
+        pos = surv.find(1)
+        while pos != -1:                    # unextendable survivors
+            if pos not in ext:
+                out.append((d, pos, start(d, pos)))
+            pos = surv.find(1, pos + 1)
+        for b in sorted(ext):               # extendable classes: exact test
+            if flags[d][b]:
+                e = start(d, b)
+                if not any(flags[dp][b % dp] and e >= start(dp, b % dp)
+                           for dp in divisors(d)[:-1]):
+                    out.append((d, b, e))
+    return out
+
+def tail_tokens(cands, P, Rb):
+    """Coverage-signature compression of the tail: residues of R covered by
+    exactly the same candidates are one token.  Returns the sorted list of
+    distinct masks; bit i of a mask marks coverage by candidate i."""
+    if not cands:
+        return []
+    nplanes = (len(cands) + 7) // 8
+    rec = next((r for r in (1, 2, 4, 8) if r >= nplanes), None)
+    if rec is None:                         # more than 64 candidates
+        cover = {}
+        for i, (d, b, e) in enumerate(cands):
+            bit = 1 << i
+            for r in range(b, P, d):
+                cover[r] = cover.get(r, 0) | bit
+        return sorted(set(cover.values()))
+    planes = []
+    for j in range(rec):
+        pi = 0
+        for i in range(8 * j, min(8 * j + 8, len(cands))):
+            d, b, _ = cands[i]
+            ind = bytearray(P)
+            ind[b::d] = bytes([1 << (i - 8 * j)]) * len(range(b, P, d))
+            pi |= int.from_bytes(ind, "little")
+        planes.append(pi.to_bytes(P, "little"))
+    if rec == 1:
+        return sorted(set(planes[0]) - {0})
+    comb = bytearray(rec * P)
+    for j in range(rec):
+        comb[j::rec] = planes[j]
+    code = {2: "H", 4: "I", 8: "Q"}[rec]
+    vals = set(memoryview(bytes(comb)).cast(code)) - {0}
+    return sorted(int.from_bytes(v.to_bytes(rec, sys.byteorder), "little")
+                  for v in vals)
 
 def finite_candidates(F, F_set):
     """Maximal APs (including singletons) contained in F, as (s, d, n)."""
@@ -163,18 +263,28 @@ def set_cover(n_univ, cands):
 
 # -------------------------------------------------------- formulation (a)
 
+def token_masks(inf_c, toks):
+    """For each candidate, the bitmask of tokens it covers."""
+    tmask = [0] * len(inf_c)
+    for j, t in enumerate(toks):
+        for i in range(len(inf_c)):
+            if t >> i & 1:
+                tmask[i] |= 1 << j
+    return tmask
+
 def solve_a(inputs):
     """Minimum representation, overlap allowed.
     Returns a list of ('fin', s, d, n) and ('inf', s, d) descriptors."""
-    F, T, P, R = normalize(inputs)
-    F_set, Rs = set(F), sorted(R)
+    F, T, P, Rb = normalize(inputs)
+    F_set = set(F)
+    inf_c = infinite_candidates(F_set, T, P, Rb)
+    toks = tail_tokens(inf_c, P, Rb)
+    tmask = token_masks(inf_c, toks)
+    nF = len(F)
     eidx = {x: i for i, x in enumerate(F)}
-    tidx = {r: len(F) + i for i, r in enumerate(Rs)}
     cands = []
-    for d, b, e, coset in infinite_candidates(F_set, T, P, R):
-        m = 0
-        for r in coset:
-            m |= 1 << tidx[r]
+    for i, (d, b, e) in enumerate(inf_c):
+        m = tmask[i] << nF
         for x in range(e, T, d):
             m |= 1 << eidx[x]
         cands.append((m, (e, d, None)))
@@ -183,7 +293,7 @@ def solve_a(inputs):
         for x in range(s, s + n * d, d):
             m |= 1 << eidx[x]
         cands.append((m, (s, d, n)))
-    return set_cover(len(F) + len(Rs), cands)
+    return set_cover(nF + len(toks), cands)
 
 # -------------------------------------------------------- formulation (b)
 
@@ -205,28 +315,27 @@ def solve_b(inputs):
     """Minimum representation under the non-overlap rule: finite blocks have
     strictly ordered hulls and end before the earliest infinite start;
     infinite APs may overlap each other."""
-    F, T, P, R = normalize(inputs)
+    F, T, P, Rb = normalize(inputs)
     F_set = set(F)
-    if not R:                                   # S finite: blocks only
+    if 1 not in Rb:                             # S finite: blocks only
         return [(s, d, n) for s, d, n in greedy_runs(F)]
-    inf_c = infinite_candidates(F_set, T, P, R)
-    Rs = sorted(R)
+    inf_c = infinite_candidates(F_set, T, P, Rb)
+    toks = tail_tokens(inf_c, P, Rb)
+    tmask = token_masks(inf_c, toks)
     best = None
     for i in range(len(F) + 1):                 # cut c = F[i], or c = T
         c = F[i] if i < len(F) else T
         suffix = F[i:]
         eidx = {x: k for k, x in enumerate(suffix)}
-        tidx = {r: len(suffix) + k for k, r in enumerate(Rs)}
+        nS = len(suffix)
         cands = []
-        for d, b, e, coset in inf_c:
+        for ci, (d, b, e) in enumerate(inf_c):
             s0 = e if e >= c else c + (b - c) % d   # first AP element >= c
-            m = 0
-            for r in coset:
-                m |= 1 << tidx[r]
+            m = tmask[ci] << nS
             for x in range(s0, T, d):
                 m |= 1 << eidx[x]
             cands.append((m, (s0, d, None)))
-        tail = set_cover(len(suffix) + len(Rs), cands)
+        tail = set_cover(nS + len(toks), cands)
         if tail is None:
             continue
         blocks = [(s, d, n) for s, d, n in greedy_runs(F[:i])]
@@ -244,9 +353,9 @@ def ap_contains(st, x):
     return x >= s and (x - s) % d == 0
 
 def verify(inputs, sol, rule_b):
-    F, T, P, R = normalize(inputs)
+    F, T, P, Rb = normalize(inputs)
     F_set = set(F)
-    mem = lambda x: (x in F_set) if x < T else (x % P) in R
+    mem = lambda x: (x in F_set) if x < T else bool(Rb[x % P])
     for st in sol:                              # each chosen set inside S
         if st[2] is not None:
             s, d, n = st
@@ -254,14 +363,18 @@ def verify(inputs, sol, rule_b):
         else:
             s, d, _ = st
             assert P % d == 0, st
-            assert all(mem(x) for x in range(s, T + P, d)), st
-            assert all((s + k * d) % P in R for k in range(P // d)), st
+            assert all(mem(x) for x in range(s, T, d)), st
+            assert Rb[s % d::d].count(0) == 0, st   # tail classes inside R
     for x in F:                                 # prefix fully covered
         assert any(ap_contains(st, x) for st in sol), x
-    for r in R:                                 # each tail class owned fully
-        assert any(n is None and r % d == s % d
-                   for s, d, n in sol), r
-    for x in range(T, T + 2 * P):               # spot-check the seam
+    cov = bytearray(P)                          # every tail class owned
+    for s, d, n in sol:
+        if n is None:
+            cov[s % d::d] = class_ones(s % d, P, d)
+    Ri, Ci = int.from_bytes(Rb, "little"), int.from_bytes(cov, "little")
+    assert Ri & ~Ci == 0
+    W = min(P, 1000)                            # redundant seam spot-check
+    for x in range(T, T + 2 * W):
         assert mem(x) == any(ap_contains(st, x) for st in sol), x
     if rule_b:                                  # structural constraints
         spans = sorted((s, s + (n - 1) * d)
@@ -309,7 +422,8 @@ EXAMPLES = [
      [(0, 4, None), (2, 4, None), (1, 2, None), (5, 8, 3)]),
     ("class with an interior gap", [(0, 4, None), (2, 4, 2)]),
     ("complicated 1", [(5, 1, 11), (5, 6, 12), (7, 5, 19), (-9, 3, 13), (-7, 4, 20), (-4, 5, 13), (-5, 6, 12), (-1, 6, 11), (-2, 6, 5)]),
-    ("all primes", [(2, 5, None), (2, 7, None), (2, 11, None), (2, 13, None), (2, 17, None), (2, 19, None)]),
+    ("all primes 6", [(2, 5, None), (2, 7, None), (2, 11, None), (2, 13, None), (2, 17, None), (2, 19, None)]),
+    ("all primes 7", [(2, 5, None), (2, 7, None), (2, 11, None), (2, 13, None), (2, 17, None), (2, 19, None), (2, 23, None)]),
 ]
 
 def random_instance(rng):
