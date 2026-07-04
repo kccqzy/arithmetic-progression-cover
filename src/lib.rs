@@ -313,9 +313,7 @@ pub fn infinite_candidates(
             let src = &flags[&dp];
             for k in 0..q_usz {
                 let dst = &mut dom[k * dp_usz..(k + 1) * dp_usz];
-                for i in 0..dp_usz {
-                    dst[i] |= src[i];
-                }
+                dst.iter_mut().zip(src).for_each(|(d, s)| *d |= s);
             }
         }
         // Unextendable survivors: valid and not dominated at the byte level.
